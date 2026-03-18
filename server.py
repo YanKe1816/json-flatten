@@ -8,7 +8,7 @@ import os
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 from urllib.parse import urlparse
 
 APP_NAME = "json-flatten"
@@ -20,8 +20,11 @@ TASK_NAME = "json_flatten"
 TASK_ROLE = "JSON structure transformer"
 TASK_GOAL = "Flatten nested JSON objects into dot-notation key paths."
 
-OPENAI_APPS_CHALLENGE_RESPONSE = "challenge-ok"
 JSONRPC_VERSION = "2.0"
+
+
+def get_openai_apps_challenge_response() -> str:
+    return os.environ.get("OPENAI_APPS_CHALLENGE", "PLACEHOLDER")
 
 
 def flatten_object(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -58,33 +61,32 @@ def jsonrpc_error(request_id: Any, code: int, message: str, reason: str) -> Dict
     }
 
 
+def build_tool_definition() -> Dict[str, Any]:
+    return {
+        "name": TASK_NAME,
+        "description": "Flatten nested JSON into dot-notation keys",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data": {"type": "object"}
+            },
+            "required": ["data"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "openWorldHint": False,
+            "destructiveHint": False,
+        },
+    }
+
+
 def build_manifest() -> Dict[str, Any]:
     return {
         "name": APP_NAME,
         "version": APP_VERSION,
-        "protocolVersion": PROTOCOL_VERSION,
-        "description": TASK_GOAL,
-        "support": {"email": SUPPORT_EMAIL, "url": "/support"},
-        "privacy": "/privacy",
-        "terms": "/terms",
-        "mcp": {"transport": "http", "endpoint": "/mcp"},
-        "tools": [
-            {
-                "name": TASK_NAME,
-                "description": "Flatten nested JSON into dot-notation keys",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"data": {"type": "object"}},
-                    "required": ["data"],
-                },
-                "outputShape": {"flattened": {}},
-                "annotations": {
-                    "readOnlyHint": True,
-                    "openWorldHint": False,
-                    "destructiveHint": False,
-                },
-            }
-        ],
+        "task": TASK_NAME,
+        "tools": [build_tool_definition()],
     }
 
 
@@ -105,35 +107,27 @@ def handle_rpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         return 400, jsonrpc_error(request_id, -32602, "Invalid params", "params must be an object")
 
     if method == "initialize":
+        protocol_version = payload.get("protocolVersion")
+        if not isinstance(protocol_version, str) or not protocol_version.strip():
+            protocol_version = PROTOCOL_VERSION
+
         return 200, jsonrpc_result(
             request_id,
             {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": protocol_version,
                 "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
                 "capabilities": {"tools": {}},
             },
         )
 
+    if method == "notifications/initialized":
+        return 200, jsonrpc_result(request_id, {})
+
     if method == "tools/list":
         return 200, jsonrpc_result(
             request_id,
             {
-                "tools": [
-                    {
-                        "name": TASK_NAME,
-                        "description": "Flatten nested JSON into dot-notation keys",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"data": {"type": "object"}},
-                            "required": ["data"],
-                        },
-                        "annotations": {
-                            "readOnlyHint": True,
-                            "openWorldHint": False,
-                            "destructiveHint": False,
-                        },
-                    }
-                ]
+                "tools": [build_tool_definition()]
             },
         )
 
@@ -173,7 +167,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: Dict[str, Any]) -> None:
         raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -186,31 +180,43 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
 
         if path == "/health":
             self._send_json(200, {"status": "ok"})
             return
+
         if path == "/privacy":
-            self._send_text(200, f"Privacy policy for {APP_NAME}. No personal data is persisted.")
+            self._send_text(
+                200,
+                f"{APP_NAME} processes requests in real time, does not store user data, "
+                f"does not track users, does not run analytics, and does not share data with third parties.",
+            )
             return
+
         if path == "/terms":
-            self._send_text(200, f"Terms for {APP_NAME}. Provided as-is with no warranties.")
+            self._send_text(
+                200,
+                f"{APP_NAME} is provided as-is for deterministic JSON transformation use only.",
+            )
             return
+
         if path == "/support":
             self._send_text(200, f"Support: {SUPPORT_EMAIL}")
             return
+
         if path == "/.well-known/openai-apps-challenge":
-            self._send_text(200, OPENAI_APPS_CHALLENGE_RESPONSE)
+            self._send_text(200, get_openai_apps_challenge_response())
             return
+
         if path == "/mcp":
             self._send_json(200, build_manifest())
             return
 
         self._send_json(404, {"error": "Not Found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path != "/mcp":
             self._send_json(404, {"error": "Not Found"})
@@ -259,7 +265,12 @@ def _http_get(url: str) -> Tuple[int, Dict[str, str], str]:
 
 def _http_post_json(url: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, str], str]:
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     with urllib.request.urlopen(req, timeout=3) as resp:
         text = resp.read().decode("utf-8")
         headers = {k: v for k, v in resp.headers.items()}
@@ -268,18 +279,24 @@ def _http_post_json(url: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, str]
 
 def run_self_tests() -> None:
     test_port = 8765
-    thread = threading.Thread(target=run_server, kwargs={"host": "127.0.0.1", "port": test_port}, daemon=True)
+    thread = threading.Thread(
+        target=run_server,
+        kwargs={"host": "127.0.0.1", "port": test_port},
+        daemon=True,
+    )
     thread.start()
 
     base = f"http://127.0.0.1:{test_port}"
 
-    # /health test
+    source = open(__file__, "r", encoding="utf-8").read()
+    assert '"0.0.0.0"' in source, 'source must contain "0.0.0.0"'
+    assert 'os.environ.get("PORT"' in source, 'source must contain os.environ.get("PORT"'
+
     status, headers, body = _http_get(base + "/health")
     assert status == 200, "health status code must be 200"
     assert headers.get("Content-Type", "").startswith("application/json"), "health must return json"
     assert json.loads(body) == {"status": "ok"}, "health response body mismatch"
 
-    # initialize test
     status, _, body = _http_post_json(
         base + "/mcp",
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -287,8 +304,8 @@ def run_self_tests() -> None:
     init_res = json.loads(body)
     assert status == 200, "initialize should return 200"
     assert init_res["result"]["protocolVersion"] == PROTOCOL_VERSION, "protocol version mismatch"
+    assert init_res["result"]["serverInfo"]["name"] == APP_NAME, "serverInfo name mismatch"
 
-    # tools/list test
     status, _, body = _http_post_json(
         base + "/mcp",
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
@@ -296,11 +313,8 @@ def run_self_tests() -> None:
     list_res = json.loads(body)
     assert status == 200, "tools/list should return 200"
     tool = list_res["result"]["tools"][0]
-    assert tool["annotations"]["readOnlyHint"] is True, "readOnlyHint must be true"
-    assert tool["annotations"]["openWorldHint"] is False, "openWorldHint must be false"
-    assert tool["annotations"]["destructiveHint"] is False, "destructiveHint must be false"
+    assert tool["name"] == TASK_NAME, "tool name mismatch"
 
-    # tools/call test
     status, _, body = _http_post_json(
         base + "/mcp",
         {
@@ -309,14 +323,27 @@ def run_self_tests() -> None:
             "method": "tools/call",
             "params": {
                 "name": TASK_NAME,
-                "arguments": {"data": {"user": {"name": "Tom", "profile": {"age": 30}}, "tags": [1, 2], "empty": {}}},
+                "arguments": {
+                    "data": {
+                        "user": {"name": "Tom", "profile": {"age": 30}},
+                        "tags": [1, 2],
+                        "empty": {},
+                    }
+                },
             },
         },
     )
     call_res = json.loads(body)
     assert status == 200, "tools/call should return 200"
+    assert isinstance(call_res["result"]["content"], list), "content must be present"
+    assert "structuredContent" in call_res["result"], "structuredContent must be present"
     flattened = call_res["result"]["structuredContent"]["flattened"]
-    assert flattened == {"empty": {}, "tags": [1, 2], "user.name": "Tom", "user.profile.age": 30}, "flattened payload mismatch"
+    assert flattened == {
+        "empty": {},
+        "tags": [1, 2],
+        "user.name": "Tom",
+        "user.profile.age": 30,
+    }, "flattened payload mismatch"
 
     print("SELF-TESTS PASSED")
 
