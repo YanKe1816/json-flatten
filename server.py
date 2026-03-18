@@ -136,7 +136,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: Dict[str, Any]) -> None:
         data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
